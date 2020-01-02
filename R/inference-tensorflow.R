@@ -10,6 +10,154 @@ entry_stop_gradients <- function(target, mask) {
   tf$add(tf$stop_gradient(tf$multiply(mask_h, target)), tf$multiply(mask, target))
 }
 
+#' construct cellassign formulas for optimization
+#' 
+#' @import tensorflow
+#' 
+#' @return A list of variables for EM optimization
+#' 
+#' @keywords  internal
+construct_tf_formulas <- function(G, C, P, B, minY, maxY, shrinkage, min_delta, dirichlet_concentration, random_seed, tf, tfd){
+  B <- as.integer(B)
+  # Data placeholders
+  Y_ <- tf$placeholder(tf$float64, shape = shape(NULL, G), name = "Y_")
+  X_ <- tf$placeholder(tf$float64, shape = shape(NULL, P), name = "X_")
+  s_ <- tf$placeholder(tf$float64, shape = shape(NULL), name = "s_")
+  rho_ <- tf$placeholder(tf$float64, shape = shape(G,C), name = "rho_")
+  
+  # Variables
+  delta_log <- tf$Variable(tf$random_uniform(shape(G,C),
+                                             minval = -2,
+                                             maxval = 2,
+                                             seed = random_seed,
+                                             dtype = tf$float64),
+                           dtype = tf$float64,
+                           constraint = function(x) {
+                             tf$clip_by_value(x,
+                                              tf$constant(log(min_delta),
+                                                          dtype = tf$float64),
+                                              tf$constant(Inf, dtype = tf$float64))
+                           })
+  
+  # Stop gradient for irrelevant entries of delta_log
+  delta_log <- entry_stop_gradients(delta_log, tf$cast(rho_, tf$bool))
+  
+  beta <- tf$Variable(tf$random_normal(shape(G,P),
+                                       mean = 0,
+                                       stddev = 1,
+                                       seed = random_seed,
+                                       dtype = tf$float64),
+                      dtype = tf$float64)
+  
+  theta_logit <- tf$Variable(tf$random_normal(shape(C),
+                                              mean = 0,
+                                              stddev = 1,
+                                              seed = random_seed,
+                                              dtype = tf$float64),
+                             dtype = tf$float64)
+  
+  
+  ## Spline variables
+  a <- tf$exp(tf$Variable(tf$zeros(shape = B, dtype = tf$float64)))
+  
+  ## initiate b
+  basis_means_fixed <- seq(from = minY, to = maxY, length.out = B)
+  b_init <- 2 * (basis_means_fixed[2] - basis_means_fixed[1])^2
+  b <- tf$exp(tf$constant(rep(-log(b_init), B), dtype = tf$float64))
+  
+  # calculate log expression mean
+  # mean
+  base_mean_ng <- tf$transpose(tf$einsum('np,gp->gn', X_, beta) +
+                                 tf$log(s_))
+  
+  base_mean_list <- list()
+  for(c in seq_len(C)) base_mean_list[[c]] <- base_mean_ng
+  base_mean_ngc <- tf$stack(base_mean_list, 2)
+  
+  # gene/cell_type specific expression: delta * rho*
+  delta <- tf$exp(delta_log)
+  additional_mean_ngc <- tf$multiply(delta, rho_)
+  
+  # add base mean to gene/cell_type specific expression to generate mean (for the NB distribution)
+  mu_ngc <- tf$add(base_mean_ngc, additional_mean_ngc, name = "adding_base_mean_to_delta_rho")
+  
+  # calculate NB dispersion
+  basis_means <- tf$constant(basis_means_fixed, dtype = tf$float64)
+  LOWER_BOUND <- 1e-10
+  
+  mu_cng <- tf$transpose(mu_ngc, shape(2,0,1))
+  mu_cngb <- tf$tile(tf$expand_dims(mu_cng, axis = 3L), c(1L, 1L, 1L, B))
+  phi_cng <- tf$reduce_sum(a * tf$exp(-b * tf$square(mu_cngb - basis_means)), 3L) + LOWER_BOUND
+  phi_ngc <- tf$transpose(phi_cng, shape(1,2,0))
+  
+  # convert log expression mean to expression mean
+  mu_ngc <- tf$exp(mu_ngc)
+  
+  # calculate NB parameters
+  # probability of success
+  nb_probability <- mu_ngc / (mu_ngc + phi_ngc)
+  # NB PDF
+  nb_pdf <- tfd$NegativeBinomial(probs = nb_probability, total_count = phi_ngc)
+  
+  # calculate negative binomial probabilities
+  Y_tensor_list <- list()
+  for(c in seq_len(C)) Y_tensor_list[[c]] <- Y_
+  Y_ngc <- tf$stack(Y_tensor_list, axis = 2)
+  
+  y_log_prob_ncg <- tf$transpose(nb_pdf$log_prob(Y_ngc), shape(0, 2, 1))
+  
+  # sum y_log_prob over gene
+  y_log_prob_nc <- tf$reduce_sum(y_log_prob_ncg, 2L)
+  
+  # theta: probability of cell n belonging to cell type c
+  theta_log <- tf$nn$log_softmax(theta_logit)
+  
+  y_z_log_prob_nc <- y_log_prob_nc + theta_log
+  y_z_log_prob_cn <- tf$transpose(y_z_log_prob_nc, shape(1, 0))
+  
+  y_z_log_prob_n <- tf$reshape(tf$reduce_logsumexp(y_z_log_prob_cn, 0L), shape(1,-1))
+  
+  # E-step gamma
+  gamma <- tf$transpose(tf$exp(y_z_log_prob_cn - y_z_log_prob_n))
+  
+  # M-step formula: Q to be minimized
+  gamma_fixed <- tf$placeholder(dtype = tf$float64, shape = shape(NULL,C), name = "gamma_fixed")
+  Q <- -tf$einsum('nc,cn->', gamma_fixed, y_z_log_prob_cn)
+  
+  ## add theta log probs and delta log probs to Q
+  
+  # delta priors
+  if (shrinkage) {
+    delta_log_mean <- tf$Variable(0, dtype = tf$float64)
+    delta_log_variance <- tf$Variable(1, dtype = tf$float64) # May need to bound this or put a prior over this
+    
+    delta_log_prior <- tfd$Normal(loc = delta_log_mean * rho_,
+                                  scale = delta_log_variance)
+    delta_log_prob <- -tf$reduce_sum(delta_log_prior$log_prob(delta_log))
+    Q <- Q + delta_log_prob
+  }
+  
+  # theta priors
+  THETA_LOWER_BOUND <- 1e-20
+  theta_log_prior <- tfd$Dirichlet(concentration = tf$constant(dirichlet_concentration, dtype = tf$float64))
+  theta_log_prob <- -theta_log_prior$log_prob(tf$exp(theta_log) + THETA_LOWER_BOUND)
+  
+  Q <- Q + delta_log_prob
+  
+  # marginal log likelihood fo monitoring EM convergence
+  L_y = tf$reduce_sum(tf$reduce_logsumexp(y_z_log_prob_cn, 0L))
+  
+  L_y <- L_y - theta_log_prob
+  if (shrinkage) {
+    L_y <- L_y - delta_log_prob
+    list(Q = Q, L_y = L_y, gamma = gamma, 
+         delta = delta, beta = beta, phi = phi_ngc, mu_ngc = mu_ngc, a = a, theta = tf$exp(theta_log), 
+         ld_mean = delta_log_mean, ld_var = delta_log_variance)
+  }else{
+    list(Q = Q, L_y = L_y, gamma = gamma, 
+         delta = delta, beta = beta, phi = phi_ngc, mu_ngc = mu_ngc, a = a, theta = tf$exp(theta_log))
+  }
+}
 
 
 #' cellassign inference in tensorflow, semi-supervised version
@@ -41,199 +189,65 @@ inference_tensorflow <- function(Y,
                                  min_delta = 2,
                                  dirichlet_concentration = rep(1e-2, C),
                                  threads = 0) {
-
   tf <- tf$compat$v1
   tf$disable_v2_behavior()
-
+  
   tfp <- reticulate::import('tensorflow_probability')
   tfd <- tfp$distributions
-
-
+  
   tf$reset_default_graph()
-
-  # Data placeholders
-  Y_ <- tf$placeholder(tf$float64, shape = shape(NULL, G), name = "Y_")
-  X_ <- tf$placeholder(tf$float64, shape = shape(NULL, P), name = "X_")
-  s_ <- tf$placeholder(tf$float64, shape = shape(NULL), name = "s_")
-  rho_ <- tf$placeholder(tf$float64, shape = shape(G,C), name = "rho_")
-
-  sample_idx <- tf$placeholder(tf$int32, shape = shape(NULL), name = "sample_idx")
-
-  # Added for splines
-  B <- as.integer(B)
-
-  basis_means_fixed <- seq(from = min(Y), to = max(Y), length.out = B)
-  basis_means <- tf$constant(basis_means_fixed, dtype = tf$float64)
-
-  b_init <- 2 * (basis_means_fixed[2] - basis_means_fixed[1])^2
-
-  LOWER_BOUND <- 1e-10
-
-  # Variables
-
-  ## Shrinkage prior on delta
-  if (shrinkage) {
-    delta_log_mean <- tf$Variable(0, dtype = tf$float64)
-    delta_log_variance <- tf$Variable(1, dtype = tf$float64) # May need to bound this or put a prior over this
-  }
-
-  ## Regular variables
-  delta_log <- tf$Variable(tf$random_uniform(shape(G,C),
-                                             minval = -2,
-                                             maxval = 2,
-                                             seed = random_seed,
-                                             dtype = tf$float64),
-                           dtype = tf$float64,
-                           constraint = function(x) {
-                             tf$clip_by_value(x,
-                                              tf$constant(log(min_delta),
-                                                          dtype = tf$float64),
-                                              tf$constant(Inf, dtype = tf$float64))
-                             })
-
-  beta <- tf$Variable(tf$random_normal(shape(G,P),
-                                       mean = 0,
-                                       stddev = 1,
-                                       seed = random_seed,
-                                       dtype = tf$float64),
-                      dtype = tf$float64)
-
-  theta_logit <- tf$Variable(tf$random_normal(shape(C),
-                                              mean = 0,
-                                              stddev = 1,
-                                              seed = random_seed,
-                                              dtype = tf$float64),
-                             dtype = tf$float64)
-
-  ## Spline variables
-  a <- tf$exp(tf$Variable(tf$zeros(shape = B, dtype = tf$float64)))
-  b <- tf$exp(tf$constant(rep(-log(b_init), B), dtype = tf$float64))
-
-  # Stop gradient for irrelevant entries of delta_log
-  delta_log <- entry_stop_gradients(delta_log, tf$cast(rho_, tf$bool))
-
-  # Transformed variables
-  delta = tf$exp(delta_log)
-  theta_log = tf$nn$log_softmax(theta_logit)
-
-  # Model likelihood
-  base_mean <- tf$transpose(tf$einsum('np,gp->gn', X_, beta) +
-                              tf$log(s_))
-
-  base_mean_list <- list()
-  for(c in seq_len(C)) base_mean_list[[c]] <- base_mean
-  mu_ngc = tf$add(tf$stack(base_mean_list, 2),
-                  tf$multiply(delta, rho_),
-                  name = "adding_base_mean_to_delta_rho")
-
-  mu_cng = tf$transpose(mu_ngc, shape(2,0,1))
-
-  mu_cngb <- tf$tile(tf$expand_dims(mu_cng, axis = 3L), c(1L, 1L, 1L, B))
-
-  phi_cng <- tf$reduce_sum(a * tf$exp(-b * tf$square(mu_cngb - basis_means)), 3L) +
-    LOWER_BOUND
-  phi <- tf$transpose(phi_cng, shape(1,2,0))
-
-  mu_ngc <- tf$transpose(mu_cng, shape(1,2,0))
-
-  mu_ngc <- tf$exp(mu_ngc)
-
-  p = mu_ngc / (mu_ngc + phi)
-
-  nb_pdf <- tfd$NegativeBinomial(probs = p, total_count = phi)
-
-
-  Y_tensor_list <- list()
-  for(c in seq_len(C)) Y_tensor_list[[c]] <- Y_
-  Y__ = tf$stack(Y_tensor_list, axis = 2)
-
-  y_log_prob_raw <- nb_pdf$log_prob(Y__)
-  y_log_prob <- tf$transpose(y_log_prob_raw, shape(0,2,1))
-  y_log_prob_sum <- tf$reduce_sum(y_log_prob, 2L) + theta_log
-  p_y_on_c_unorm <- tf$transpose(y_log_prob_sum, shape(1,0))
-
-  gamma_fixed = tf$placeholder(dtype = tf$float64, shape = shape(NULL,C))
-
-  Q = -tf$einsum('nc,cn->', gamma_fixed, p_y_on_c_unorm)
-
-  p_y_on_c_norm <- tf$reshape(tf$reduce_logsumexp(p_y_on_c_unorm, 0L), shape(1,-1))
-
-  gamma <- tf$transpose(tf$exp(p_y_on_c_unorm - p_y_on_c_norm))
-
-  ## Priors
-  if (shrinkage) {
-    delta_log_prior <- tfd$Normal(loc = delta_log_mean * rho_,
-                                  scale = delta_log_variance)
-    delta_log_prob <- -tf$reduce_sum(delta_log_prior$log_prob(delta_log))
-  }
-
-  THETA_LOWER_BOUND <- 1e-20
-
-  theta_log_prior <- tfd$Dirichlet(concentration = tf$constant(dirichlet_concentration,
-                                                               dtype = tf$float64))
-  theta_log_prob <- -theta_log_prior$log_prob(tf$exp(theta_log) + THETA_LOWER_BOUND)
-
-  ## End priors
-  Q <- Q + theta_log_prob
-  if (shrinkage) {
-    Q <- Q + delta_log_prob
-  }
-
-
-  optimizer = tf$train$AdamOptimizer(learning_rate=learning_rate)
-  train = optimizer$minimize(Q)
-
-  # Marginal log likelihood for monitoring convergence
-  L_y = tf$reduce_sum(tf$reduce_logsumexp(p_y_on_c_unorm, 0L))
-
-  L_y <- L_y - theta_log_prob
-  if (shrinkage) {
-    L_y <- L_y - delta_log_prob
-  }
-
-
+  
+  tf_formulas <- construct_tf_formulas(G, C, P, B, min(Y), max(Y), shrinkage, min_delta, dirichlet_concentration, random_seed, tf, tfd)
+  
+  gamma <- tf_formulas$gamma
+  Q <- tf_formulas$Q
+  L_y <- tf_formulas$L_y
+  
+  optimizer <- tf$train$AdamOptimizer(learning_rate=learning_rate)
+  train <- optimizer$minimize(Q)
+  
   # Split the data
   splits <- split(sample(seq_len(N), size = N, replace = FALSE), seq_len(n_batches))
-
+  
   # Start the graph and inference
-  session_conf <- tf$ConfigProto(intra_op_parallelism_threads = threads,
-                                 inter_op_parallelism_threads = threads)
+  session_conf <- tf$ConfigProto(intra_op_parallelism_threads = as.integer(threads),
+                                 inter_op_parallelism_threads = as.integer(threads))
   sess <- tf$Session(config = session_conf)
   init <- tf$global_variables_initializer()
   sess$run(init)
-
-
-  fd_full <- dict(Y_ = Y, X_ = X, s_ = s, rho_ = rho)
-
+  
+  
+  fd_full <- dict("Y_:0" = Y, "X_:0" = X, "s_:0" = s, "rho_:0" = rho)
+  
   log_liks <- ll_old <- sess$run(L_y, feed_dict = fd_full)
-
+  
   for(i in seq_len(max_iter_em)) {
     ll <- 0 # log likelihood for this "epoch"
     for(b in seq_len(n_batches)) {
-
-      fd <- dict(Y_ = Y[splits[[b]], ],
-                 X_ = X[splits[[b]], , drop = FALSE],
-                 s_ = s[splits[[b]]],
-                 rho_ = rho)
-
+      
+      fd <- dict("Y_:0" = Y[splits[[b]], ],
+                 "X_:0" = X[splits[[b]], , drop = FALSE],
+                 "s_:0" = s[splits[[b]]],
+                 "rho_:0" = rho)
+      
       g <- sess$run(gamma, feed_dict = fd)
-
+      
       # M-step
-      gfd <- dict(Y_ = Y[splits[[b]], ],
-                  X_ = X[splits[[b]], , drop = FALSE],
-                  s_ = s[splits[[b]]],
-                  rho_ = rho,
-                  gamma_fixed = g)
-
+      gfd <- dict("Y_:0" = Y[splits[[b]], ],
+                  "X_:0" = X[splits[[b]], , drop = FALSE],
+                  "s_:0" = s[splits[[b]]],
+                  "rho_:0" = rho,
+                  "gamma_fixed:0" = g)
+      
       Q_old <- sess$run(Q, feed_dict = gfd)
       Q_diff <- rel_tol_adam + 1
       mi = 0
-
+      
       while(mi < max_iter_adam && Q_diff > rel_tol_adam) {
         mi <- mi + 1
-
+        
         sess$run(train, feed_dict = gfd)
-
+        
         if(mi %% 20 == 0) {
           if (verbose) {
             message(paste(mi, sess$run(Q, feed_dict = gfd)))
@@ -243,41 +257,35 @@ inference_tensorflow <- function(Y,
           Q_old <- Q_new
         }
       } # End gradient descent
-
+      
       l_new = sess$run(L_y, feed_dict = gfd) # Log likelihood for this "epoch"
       ll <- ll + l_new
     }
-
+    
     ll_diff <- (ll - ll_old) / abs(ll_old)
-
+    
     if(verbose) {
       message(sprintf("%i\tL old: %f; L new: %f; Difference (%%): %f",
                       mi, ll_old, ll, ll_diff))
     }
     ll_old <- ll
     log_liks <- c(log_liks, ll)
-
+    
     if (ll_diff < rel_tol_em) {
       break
     }
   }
-
+  
   # Finished EM - peel off final values
-  variable_list <- list(delta, beta, phi, gamma, mu_ngc, a, tf$exp(theta_log))
-  variable_names <- c("delta", "beta", "phi", "gamma", "mu", "a", "theta")
-
-
-  if (shrinkage) {
-    variable_list <- c(variable_list, list(delta_log_mean, delta_log_variance))
-    variable_names <- c(variable_names, "ld_mean", "ld_var")
-  }
-
+  variable_list <- list(tf_formulas$delta, tf_formulas$beta, tf_formulas$phi, tf_formulas$gamma, tf_formulas$mu_ngc, tf_formulas$theta)
+  variable_names <- c("delta", "beta", "phi", "gamma", "mu_ngc", "theta")
+  
   mle_params <- sess$run(variable_list, feed_dict = fd_full)
   names(mle_params) <- variable_names
   sess$close()
-
+  
   mle_params$delta[rho == 0] <- 0
-
+  
   if(is.null(colnames(rho))) {
     colnames(rho) <- paste0("cell_type_", seq_len(ncol(rho)))
   }
@@ -286,17 +294,16 @@ inference_tensorflow <- function(Y,
   colnames(mle_params$delta) <- colnames(rho)
   rownames(mle_params$beta) <- rownames(rho)
   names(mle_params$theta) <- colnames(rho)
-
-
+  
+  
   cell_type <- get_mle_cell_type(mle_params$gamma)
-
+  
   rlist <- list(
     cell_type = cell_type,
     mle_params = mle_params,
     lls=log_liks
   )
-
-  return(rlist)
-
+  
+  rlist
+  
 }
-
