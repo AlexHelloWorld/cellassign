@@ -123,6 +123,7 @@ cellassign <- function(exprs_obj,
                        X = NULL,
                        B = 10,
                        shrinkage = TRUE,
+                       distribution = "Negative Binomial",
                        n_batches = 1,
                        dirichlet_concentration = 1e-2,
                        rel_tol_adam = 1e-4,
@@ -136,6 +137,7 @@ cellassign <- function(exprs_obj,
                        num_runs = 1,
                        threads = 0) {
 
+  print("my cellassign")
   # Work out rho
   rho <- NULL
   if(is.matrix(marker_gene_info)) {
@@ -243,6 +245,7 @@ cellassign <- function(exprs_obj,
                                 P = P,
                                 B = B,
                                 shrinkage = shrinkage,
+                                distribution = distribution,
                                 verbose = verbose,
                                 n_batches = n_batches,
                                 rel_tol_adam = rel_tol_adam,
