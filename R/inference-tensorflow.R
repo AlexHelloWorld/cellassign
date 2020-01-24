@@ -10,6 +10,50 @@ entry_stop_gradients <- function(target, mask) {
   tf$add(tf$stop_gradient(tf$multiply(mask_h, target)), tf$multiply(mask, target))
 }
 
+#' Estimate base expression for each marker gene
+#' 
+#' Given the normalized expression matrix, estimate base expression for each gene 
+#' by fitting normalized expression data to gaussian mixture models
+#' 
+#' This function takes the normalized expression matrix and return a list of base expression estimates
+#' The input list should be the complete normalized expression matrix
+#' @param Y normalized expression matrix with all genes
+#' 
+#' @import mixdist
+#' 
+#' @return a numeric list of base expression estimates
+#'
+estimate_base_expression <- function(Y){
+  baseExpression <- vector()
+  for(i in 1:ncol(Y)){
+    his <- hist(Y[, i], breaks = 50, plot = FALSE)
+    df <- data.frame(mid=his$mids, cou=his$counts)
+    
+    medianExpression <- median(Y[, i])
+    guess_mean <- c(medianExpression - 1, medianExpression + 1)
+    guess_sigma <- c(1, 1)
+    guess_dist <- "norm"
+    
+    fitpro <- tryCatch(mix(as.mixdata(df), mixparam(mu=guess_mean, sigma=guess_sigma), dist=guess_dist),
+                       warning = function(cond){
+                         message(paste0("Warning when fit gaussian mixture model: ", i))
+                         NULL
+                       },
+                       error = function(cond){
+                         message(paste0("Error when fit gaussian mixture model: ", i))
+                         NULL
+                         }
+                       )
+    
+    if(is.null(fitpro)){
+      baseExpression <- c(baseExpression, 0)
+    }else{
+      baseExpression <- c(baseExpression, min(fitpro$parameters[, "mu"]))
+    }
+  }
+  baseExpression
+}
+
 #' construct cellassign formulas for optimization (Raw expression matrix. Negative binomial distribution hypothesis)
 #' 
 #' @import tensorflow
@@ -166,7 +210,7 @@ construct_tf_formulas <- function(G, C, P, B, minY, maxY, shrinkage, min_delta, 
 #' @return A list of variables for EM optimization
 #' 
 #' @keywords  internal
-construct_gaussian_formulas <- function(G, C, P, B, shrinkage, min_delta, dirichlet_concentration, random_seed, tf, tfd){
+construct_gaussian_formulas <- function(G, C, P, B, base_mean_estimates, shrinkage, min_delta, dirichlet_concentration, random_seed, tf, tfd){
   
   B <- as.integer(B)
   # Data placeholders
@@ -207,13 +251,23 @@ construct_gaussian_formulas <- function(G, C, P, B, shrinkage, min_delta, dirich
                              dtype = tf$float64)
   
   # normal distribution standard deviation 
-  k <- tf$Variable(1.0, dtype = tf$float64)
-  b <- tf$Variable(0.01, dtype = tf$float64)
+  k <- tf$Variable(1.0, dtype = tf$float64, constraint = function(x) {
+    tf$clip_by_value(x,
+                     tf$constant(0, dtype = tf$float64),
+                     tf$constant(Inf, dtype = tf$float64))
+  })
+  b <- tf$Variable(0.01, dtype = tf$float64, constraint = function(x) {
+    tf$clip_by_value(x,
+                     tf$constant(0.0001, dtype = tf$float64),
+                     tf$constant(Inf, dtype = tf$float64))
+  })
+  
+  # add gene expression base
+  gene_base <- tf$constant(base_mean_estimates, dtype = tf$float64)
   
   # calculate log expression mean
   # base mean
-  base_mean_ng <- tf$transpose(tf$einsum('np,gp->gn', X_, beta) +
-                                 tf$log(s_))
+  base_mean_ng <- gene_base + tf$transpose(tf$einsum('np,gp->gn', X_, beta) + tf$log(s_))
   
   base_mean_list <- list()
   for(c in seq_len(C)) base_mean_list[[c]] <- base_mean_ng
@@ -227,7 +281,7 @@ construct_gaussian_formulas <- function(G, C, P, B, shrinkage, min_delta, dirich
   mu_ngc <- tf$add(base_mean_ngc, additional_mean_ngc, name = "adding_base_mean_to_delta_rho")
   
   # compute the standard deviation sigma of the normal distribution
-  sigma_ngc <- tf$nn$relu(k * mu_ngc) + b
+  sigma_ngc <- tf$sqrt(tf$nn$relu(k * mu_ngc) + b)
   
   # normal distribution
   gaussian_pdf <- tfd$Normal(loc = mu_ngc, scale = sigma_ngc)
@@ -335,7 +389,8 @@ inference_tensorflow <- function(Y,
   if(distribution == "Negative Binomial"){
     tf_formulas <- construct_tf_formulas(G, C, P, B, min(Y), max(Y), shrinkage, min_delta, dirichlet_concentration, random_seed, tf, tfd)
   }else if(distribution == "Normal"){
-    tf_formulas <- construct_gaussian_formulas(G, C, P, B, shrinkage, min_delta, dirichlet_concentration, random_seed, tf, tfd)
+    base_mean_estimates <- estimate_base_expression(Y)
+    tf_formulas <- construct_gaussian_formulas(G, C, P, B, base_mean_estimates, shrinkage, min_delta, dirichlet_concentration, random_seed, tf, tfd)
   }else{
     stop("Only support expression distribution: 'Negative Binomial' and 'Normal'")
   }

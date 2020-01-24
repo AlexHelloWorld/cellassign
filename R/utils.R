@@ -119,6 +119,7 @@ initialize_X <- function(X, N, verbose = FALSE) {
 }
 
 
+
 #' Check for tensorflow
 #'
 #' @keywords internal
