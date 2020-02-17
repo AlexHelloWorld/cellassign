@@ -1,12 +1,17 @@
 sudo: required
 language: r
 warnings_are_errors: false
-dist: trusty
+dist: xenial
 r: bioc-devel
+
+branches:
+  only:
+    - bioc
+    - master
+    - basilisk
 
 r_packages:
   - devtools
-  - tensorflow
   - rmarkdown
 
 biocpackages:
@@ -23,16 +28,16 @@ addons:
     sources:
       ubuntu-toolchain-r-test
     packages:
+      - imagemagick
       - libmagick++-dev
       - wget
-      - libatlas3gf-base
+      - libatlas3-base
       - libatlas-dev
       - python-joblib
       - python-dev
       - libv8-dev
 
 before_install:
-  - python -m pip install --user --upgrade pip
-  - pip install --user numpy
-  - pip install --user tensorflow
-  - pip install --user tensorflow-probability
+  - R -e 'Sys.setenv(PIP_QUIET=1); install.packages("tensorflow"); tensorflow::install_tensorflow(extra_packages="tensorflow-probability", version = "2.1.0")'
+  - R -e 'tensorflow::tf_config()'
+

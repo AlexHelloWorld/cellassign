@@ -20,7 +20,7 @@
 
 ``` r
 install.packages("tensorflow")
-tensorflow::install_tensorflow(extra_packages='tensorflow-probability')
+tensorflow::install_tensorflow(extra_packages='tensorflow-probability', version = "2.1.0")
 ```
 
 Please ensure this installs version 2 of tensorflow. You can check this by calling
@@ -30,7 +30,7 @@ tensorflow::tf_config()
 ```
 
 ```
-TensorFlow v2.0.0 (/usr/local/lib/python3.7/site-packages/tensorflow)
+TensorFlow v2.1.0 (/usr/local/lib/python3.7/site-packages/tensorflow)
 ```
 
 `cellassign` can then be installed from github:
@@ -49,11 +49,13 @@ With [conda](https://conda.io/miniconda.html), install the current release versi
 conda install -c conda-forge -c bioconda r-cellassign
 ```
 
-## Vignettes
+## Documentation
 
-- [Assigning single-cells to known cell types with CellAssign](https://irrationone.github.io/cellassign/introduction-to-cellassign.html)
+Package documentation can be found [here](https://irrationone.github.io/cellassign/index.html). This includes the following vignettes:
 
-- [Constructing marker genes from purified bulk/scRNA-seq data](https://irrationone.github.io/cellassign/constructing-markers-from-purified-data.html)
+- [Assigning single-cells to known cell types with CellAssign](https://irrationone.github.io/cellassign/articles/introduction-to-cellassign.html)
+
+- [Constructing marker genes from purified bulk/scRNA-seq data](https://irrationone.github.io/cellassign/articles/constructing-markers-from-purified-data.html)
 
 ## Basic usage
 
@@ -85,6 +87,12 @@ Please see the package vignette for details and caveats.
 # Paper
 
 [Probabilistic cell-type assignment of single-cell RNA-seq for tumor microenvironment profiling, _Nature Methods 2019_](https://www.nature.com/articles/s41592-019-0529-1)
+
+# Code of Conduct 
+
+Please note that the 'cellassign' project is released with a
+[Contributor Code of Conduct](CODE_OF_CONDUCT.md).
+By contributing to this project, you agree to abide by its terms.
 
 # Authors
 
